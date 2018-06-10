@@ -16,37 +16,65 @@
 
 package lt.dvim.vent
 
-import akka.actor.ActorSystem
-import akka.io.Udp
-import akka.stream.scaladsl.{Source, Tcp}
-import akka.stream.{ActorMaterializer, Materializer}
-import lt.dvim.msqp.{IpPort, Region, Request}
+import java.net.InetSocketAddress
+
+import akka.actor.{Actor, ActorSystem, Props}
+import akka.stream.alpakka.udp.UdpMessage
+import akka.stream.alpakka.udp.scaladsl.Udp
+import akka.stream.scaladsl.SourceQueueWithComplete
+import akka.stream.scaladsl.Sink
+import akka.stream.scaladsl.Source
+import akka.stream.{ActorMaterializer, Materializer, OverflowStrategy}
+import akka.util.ByteString
+import lt.dvim.msqp.{IpPort, Region, Request, Response}
+import scodec.Codec
+import scodec.bits.BitVector
 import scodec.protocols.ip.Port
 import scodec.protocols.ip.v4.Address
 
 import scala.io.StdIn
 
+class ServerStreamActor(masterServer: InetSocketAddress) extends Actor {
+
+  implicit val sys = context.system
+  implicit val mat = ActorMaterializer()
+
+  val bindFlow = Udp.bindFlow(new InetSocketAddress(0))
+  val queue: SourceQueueWithComplete[Request] = Source
+    .queue[Request](bufferSize = 4, OverflowStrategy.fail)
+    .map(Codec.encode(_))
+    .map(attempt => ByteString(attempt.toOption.get.toByteArray))
+    .map(UdpMessage(_, masterServer))
+    .via(bindFlow)
+    .map(msg => BitVector(msg.data.toArray))
+    .map(Codec.decode[Response](_).require.value)
+    .to(Sink.foreach(self ! _))
+    .run()
+
+  var serversSoFar = 0
+
+  override def receive = {
+    case r: Request => queue.offer(r)
+    case Response(servers) =>
+      serversSoFar += servers.size
+      println(s"Got no of servers [${servers.size}], so far [$serversSoFar]")
+      println(s"Last server [${servers.last}]")
+      self ! Request(Region.Europe, servers.last, "")
+  }
+}
+
 object MasterServerList {
   def main(args: Array[String]): Unit = {
+    val sys = ActorSystem("MasterServerList")
 
-    implicit val sys = ActorSystem("MasterServerList")
-    implicit val mat = ActorMaterializer()
+    val masterServer = new InetSocketAddress("hl2master.steampowered.com", 27011)
+    val stream = sys.actorOf(Props(new ServerStreamActor(masterServer)))
 
-    try {
-      run()
+    val initialRequest =
+      Request(Region.Europe, IpPort(Address.fromStringValid("0.0.0.0"), Port(0)), "")
+    stream ! initialRequest
 
-      StdIn.readLine()
-    } finally {
-      sys.terminate()
-    }
-
-  }
-
-  def run()(implicit sys: ActorSystem, mat: Materializer): Unit = {
-
-    Source.single(Request(Region.Europe, IpPort(Address.fromStringValid("0.0.0.0"), Port(0)), ""))
-
-    Tcp
-
+    StdIn.readLine()
+    sys.terminate()
   }
 }
